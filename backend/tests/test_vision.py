@@ -1,8 +1,10 @@
 import asyncio
+from io import BytesIO
 import json
 
 import httpx
 import pytest
+from PIL import Image
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -103,6 +105,31 @@ def test_analyze_route_rejects_oversized_upload(monkeypatch):
     assert response.status_code == 413
 
 
+def test_oversized_model_image_is_resized_aspect_preserved_and_encoded_as_jpeg():
+    original = Image.new("RGB", (3000, 1500), color=(30, 100, 50))
+    encoded = BytesIO()
+    original.save(encoded, format="PNG")
+
+    prepared, content_type = gemma.prepare_model_image(encoded.getvalue(), "image/png")
+
+    with Image.open(BytesIO(prepared)) as resized:
+        assert resized.format == "JPEG"
+        assert resized.size == (1280, 640)
+    assert content_type == "image/jpeg"
+
+
+def test_small_jpeg_model_image_is_not_upscaled_or_reencoded():
+    original = Image.new("RGB", (640, 360), color=(30, 100, 50))
+    encoded = BytesIO()
+    original.save(encoded, format="JPEG", quality=90)
+    image_bytes = encoded.getvalue()
+
+    prepared, content_type = gemma.prepare_model_image(image_bytes, "image/jpeg")
+
+    assert prepared == image_bytes
+    assert content_type == "image/jpeg"
+
+
 def install_gemini_mock(monkeypatch, handler):
     original_client = httpx.AsyncClient
 
@@ -122,18 +149,19 @@ def gemini_response(text, status=200):
     )
 
 
-def test_model_output_is_parsed_and_schema_validated(monkeypatch):
+def test_valid_bird_model_response_is_parsed_and_schema_validated(monkeypatch):
     def handler(request):
         assert request.headers["x-goog-api-key"] == "test-key"
         body = json.loads(request.content)
         prompt = body["systemInstruction"]["parts"][0]["text"] + body["contents"][0]["parts"][0]["text"]
-        assert body["generationConfig"]["maxOutputTokens"] == 4096
-        assert "Limit evidence_details to three concise items" in prompt
-        assert "visible_evidence concise labels for those same items" in prompt
-        assert "zero to three plausible candidates" in prompt
-        assert "zero to three objects" in prompt
-        assert "candidates[0] must be the leading identification" in prompt
-        assert "exactly match the top-level common_name and scientific_name" in prompt
+        assert body["generationConfig"]["maxOutputTokens"] == 2048
+        assert "at most 3 short visible_evidence items" in prompt
+        assert "at most 2 short interesting_facts" in prompt
+        assert "at most 1 short observation_task" in prompt
+        assert "No repeated descriptions, Markdown, preamble, or extra keys" in prompt
+        assert "animals (including birds), plants, fungi" in prompt
+        assert "microorganisms (including bacteria)" in prompt
+        assert "exactly" in prompt and "add no keys" in prompt
         return gemini_response(json.dumps(result_data()))
 
     install_gemini_mock(monkeypatch, handler)
@@ -144,6 +172,83 @@ def test_model_output_is_parsed_and_schema_validated(monkeypatch):
     assert result.comparison_summary
     assert result.observe_next
     assert result.change_summary
+
+
+def test_valid_bacteria_model_response_is_accepted(monkeypatch):
+    bacteria = result_data(
+        status="uncertain", common_name="Bacteria", scientific_name=None,
+        confidence="low", summary="Small clustered cells are visible, but species-level details are not.",
+        visible_evidence=["Small clustered cells"],
+        evidence_details=[{
+            "feature": "Small clustered cells", "inference": "Consistent with a bacterial colony",
+            "support": "weak", "limitation": "The image does not show species-level features",
+            "source": "original_image",
+        }],
+        evidence_assessment={"quality": "partial", "rationale": "Cell shape is visible, but diagnostic detail is limited.",
+                             "supporting_points": ["Clustered cell-like forms"], "limitations": ["Scale is unknown"]},
+        candidates=[{
+            "common_name": "Bacteria", "scientific_name": None,
+            "match_explanation": "The visible forms are consistent with bacteria, without enough detail for a narrower identification.",
+            "supporting_features": ["Clustered cell-like forms"], "distinguishing_features": [],
+            "uncertainties": ["Species cannot be determined from this image"],
+        }],
+        observation_tasks=[],
+    )
+    install_gemini_mock(monkeypatch, lambda request: gemini_response(json.dumps(bacteria)))
+
+    result = asyncio.run(gemma.analyze_image(b"photo", "image/jpeg"))
+
+    assert result.common_name == "Bacteria"
+    assert result.status == "uncertain"
+
+
+def test_valid_mammal_model_response_is_accepted(monkeypatch):
+    mammal = result_data(
+        common_name="Red Fox", scientific_name="Vulpes vulpes",
+        summary="Coat and muzzle fit a red fox.",
+        visible_evidence=["Reddish coat", "Pointed muzzle"],
+        evidence_details=[
+            {"feature": "Reddish coat", "inference": "Consistent with a red fox", "support": "moderate",
+             "limitation": "Lighting can alter coat color", "source": "original_image"},
+            {"feature": "Pointed muzzle", "inference": "Consistent with a fox", "support": "weak",
+             "limitation": "The face is partly obscured", "source": "original_image"},
+        ],
+        evidence_assessment={"quality": "partial", "rationale": "Two clues fit; lighting limits certainty.",
+                             "supporting_points": ["Reddish coat"], "limitations": ["Face partly hidden"]},
+        candidates=[{
+            "common_name": "Red Fox", "scientific_name": "Vulpes vulpes",
+            "match_explanation": "Coat and muzzle fit.",
+            "supporting_features": ["Reddish coat", "Pointed muzzle"],
+            "distinguishing_features": [], "uncertainties": ["Lighting affects apparent coat color"],
+        }],
+        comparison_summary=None,
+        interesting_facts=["Foxes are canids."],
+        observation_tasks=[{
+            "title": "Check ear shape", "what_to_look_for": "View both ears clearly.",
+            "why_it_matters": "Ear shape helps compare foxes.", "how_safely": "Observe from a distance.",
+            "possible_outcomes": ["A clear view may help distinguish lookalikes."],
+        }],
+        observe_next=None,
+        change_summary=None,
+        disclaimer="AI hypothesis; verify with a trusted field guide.",
+    )
+
+    def handler(request):
+        body = json.loads(request.content)
+        prompt = body["systemInstruction"]["parts"][0]["text"] + body["contents"][0]["parts"][0]["text"]
+        assert body["generationConfig"]["maxOutputTokens"] == 2048
+        assert "at most 3 short visible_evidence items" in prompt
+        assert "at most 2 short interesting_facts" in prompt
+        assert "at most 1 short observation_task" in prompt
+        assert "No repeated descriptions, Markdown, preamble, or extra keys" in prompt
+        return gemini_response(json.dumps(mammal))
+
+    install_gemini_mock(monkeypatch, handler)
+
+    result = asyncio.run(gemma.analyze_image(b"photo", "image/jpeg"))
+
+    assert result.common_name == "Red Fox"
+    assert result.scientific_name == "Vulpes vulpes"
 
 
 def test_token_usage_logging_is_allowlisted_and_does_not_log_raw_metadata(monkeypatch, caplog):
@@ -255,6 +360,19 @@ def test_invalid_enum_is_not_accepted_as_a_complete_structured_result(monkeypatc
         asyncio.run(gemma.analyze_image(b"photo", "image/jpeg"))
 
 
+def test_schema_validation_logs_only_field_paths_and_error_types(monkeypatch, caplog):
+    invalid = result_data(confidence="certain", summary="MODEL_OUTPUT_SECRET")
+    install_gemini_mock(monkeypatch, lambda request: gemini_response(json.dumps(invalid)))
+    with caplog.at_level("WARNING", logger="app.services.vision"):
+        with pytest.raises(ValueError, match="failed schema validation"):
+            asyncio.run(gemma.analyze_image(b"photo", "image/jpeg"))
+
+    assert "confidence" in caplog.text
+    assert "literal_error" in caplog.text
+    assert "MODEL_OUTPUT_SECRET" not in caplog.text
+    assert "test-key" not in caplog.text
+
+
 def test_api_rate_limit_fails_without_retry(monkeypatch):
     calls = 0
 
@@ -269,7 +387,7 @@ def test_api_rate_limit_fails_without_retry(monkeypatch):
     assert calls == 1
 
 
-def test_max_tokens_reports_truncation_without_retry(monkeypatch):
+def test_max_tokens_reports_truncation_and_safe_usage_without_retry(monkeypatch, caplog):
     calls = 0
 
     def handler(request):
@@ -278,16 +396,25 @@ def test_max_tokens_reports_truncation_without_retry(monkeypatch):
         return httpx.Response(
             200,
             json={"candidates": [{
-                "content": {"parts": [{"text": '{"status":"identified","common_name":"House'}]},
+                "content": {"parts": [{"text": '{"status":"identified","common_name":"MODEL_OUTPUT_SECRET'}]},
                 "finishReason": "MAX_TOKENS",
-            }]},
+            }], "usageMetadata": {
+                "promptTokenCount": 321, "candidatesTokenCount": 2048, "thoughtsTokenCount": 17,
+            }},
             request=httpx.Request("POST", "https://generativelanguage.googleapis.com/mock"),
         )
 
     install_gemini_mock(monkeypatch, handler)
-    with pytest.raises(gemma.ModelOutputTruncatedError, match="output was truncated"):
-        asyncio.run(gemma.analyze_image(b"photo", "image/jpeg"))
+    with caplog.at_level("INFO", logger="app.services.vision"):
+        with pytest.raises(gemma.ModelOutputTruncatedError, match="2048-token limit"):
+            asyncio.run(gemma.analyze_image(b"photo", "image/jpeg"))
     assert calls == 1
+    assert "finish_reason=MAX_TOKENS" in caplog.text
+    assert "prompt_tokens=321" in caplog.text
+    assert "candidate_tokens=2048" in caplog.text
+    assert "thought_tokens=17" in caplog.text
+    assert "MODEL_OUTPUT_SECRET" not in caplog.text
+    assert "test-key" not in caplog.text
 
 
 def test_portrait_scope_is_explicitly_unknown_without_person_identification(monkeypatch):
@@ -302,7 +429,7 @@ def test_portrait_scope_is_explicitly_unknown_without_person_identification(monk
     def handler(request):
         body = json.loads(request.content)
         system_prompt = body["systemInstruction"]["parts"][0]["text"]
-        assert "do not identify a person" in system_prompt
+        assert "Do not identify people" in system_prompt
         assert "Out of scope" in system_prompt
         return gemini_response(json.dumps(out_of_scope))
 
@@ -380,11 +507,11 @@ def test_follow_up_user_text_is_not_marked_as_image_evidence(monkeypatch):
         body = json.loads(request.content)
         captured["prompt"] = body["contents"][0]["parts"][0]["text"]
         body = json.loads(request.content)
-        assert body["generationConfig"]["maxOutputTokens"] == 4096
+        assert body["generationConfig"]["maxOutputTokens"] == 2048
         assert body["generationConfig"]["responseMimeType"] == "application/json"
         assert "SHORT complete JSON object" in captured["prompt"]
-        assert "at most 3 candidates" in captured["prompt"]
-        assert "at most 3 observation_tasks" in captured["prompt"]
+        assert "at most 2 candidates" in captured["prompt"]
+        assert "at most 1 observation_task" in captured["prompt"]
         return gemini_response(json.dumps(result_data(change_summary="New detail added.")))
 
     install_gemini_mock(monkeypatch, handler)
